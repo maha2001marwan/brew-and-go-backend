@@ -1,0 +1,154 @@
+# ╔══════════════════════════════════════════════════════════╗
+# ║  Brew & Go  ·  GitLab CI/CD Pipeline  ·  v2.0.0          ║
+# ║                                                           ║
+# ║  Stages:                                                  ║
+# ║    1. lint     — ESLint code quality check                ║
+# ║    2. test     — Jest unit & integration tests            ║
+# ║    3. build    — Build Docker image (verify it compiles)   ║
+# ║    4. package  — Push image to GitLab Container Registry   ║
+# ║    5. deploy   — Trigger Render.com auto-deploy webhook    ║
+# ║    6. notify   — Print deployment summary                  ║
+# ║                                                           ║
+# ║  Required GitLab CI/CD Variables:                         ║
+# ║    RENDER_DEPLOY_HOOK  — from Render.com dashboard        ║
+# ╚══════════════════════════════════════════════════════════╝
+
+image: node:18-alpine
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_DRIVER:       overlay2
+  IMAGE_SHA:           "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  IMAGE_LATEST:        "$CI_REGISTRY_IMAGE:latest"
+  NODE_ENV:            "test"
+
+stages:
+  - lint
+  - test
+  - build
+  - package
+  - deploy
+  - notify
+
+# ── Shared Node setup ─────────────────────────────────────────
+.node_setup: &node_setup
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths: [node_modules/]
+  before_script:
+    - npm ci
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 1 — LINT
+# ─────────────────────────────────────────────────────────────
+lint:
+  stage: lint
+  <<: *node_setup
+  script:
+    - echo "==> Running ESLint..."
+    - npm run lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  allow_failure: false
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 2 — TEST
+# ─────────────────────────────────────────────────────────────
+test:
+  stage: test
+  <<: *node_setup
+  script:
+    - echo "==> Running Jest tests..."
+    - npm test
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'
+  artifacts:
+    when:    always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path:            coverage/cobertura-coverage.xml
+    paths:   [coverage/]
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 3 — BUILD  (validate Docker image builds)
+# ─────────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: docker:24.0.5
+  services: [docker:24.0.5-dind]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - echo "==> Building image $IMAGE_SHA ..."
+    - docker build --pull --target production -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+    - echo "==> Build OK"
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 4 — PACKAGE  (push to registry, main branch only)
+# ─────────────────────────────────────────────────────────────
+package:
+  stage: package
+  image: docker:24.0.5
+  services: [docker:24.0.5-dind]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build --pull --target production -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+    - docker push "$IMAGE_SHA"
+    - docker push "$IMAGE_LATEST"
+    - echo "==> Pushed $IMAGE_LATEST"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: [test, lint]
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 5 — DEPLOY  (trigger Render.com webhook — FREE & no SSH needed!)
+# ─────────────────────────────────────────────────────────────
+deploy:
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "==> Triggering Render.com deployment..."
+    - |
+      RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "$RENDER_DEPLOY_HOOK")
+      if [ "$RESPONSE" -eq 200 ] || [ "$RESPONSE" -eq 201 ]; then
+        echo "==> Deploy triggered successfully (HTTP $RESPONSE)"
+      else
+        echo "==> Deploy hook returned HTTP $RESPONSE"
+        exit 1
+      fi
+  environment:
+    name: production
+    url:  "$RENDER_APP_URL"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: [package]
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 6 — NOTIFY
+# ─────────────────────────────────────────────────────────────
+notify:
+  stage: notify
+  image: alpine:3.19
+  script:
+    - |
+      echo "╔══════════════════════════════════════════════╗"
+      echo "║  ☕  Brew & Go — Deployment Complete!          ║"
+      echo "║  Branch  : $CI_COMMIT_BRANCH                  ║"
+      echo "║  Commit  : $CI_COMMIT_SHORT_SHA               ║"
+      echo "║  Pipeline: $CI_PIPELINE_URL                   ║"
+      echo "╚══════════════════════════════════════════════╝"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: [deploy]
+  when: on_success
